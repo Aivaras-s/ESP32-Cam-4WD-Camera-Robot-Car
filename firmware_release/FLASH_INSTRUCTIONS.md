@@ -61,6 +61,77 @@ If you have the source code:
 platformio run -e esp32cam --target upload --upload-port COM9
 ```
 
+### Option 4: Web-based esptool.spacehuhn.com (Browser - No Installation)
+
+**🌟 Easiest Method - No Installation Required!**
+
+This is a web-based tool that works in **Google Chrome** or **Microsoft Edge** browsers. No software installation needed!
+
+**Steps:**
+
+1. **Prepare the files:**
+   - Download all three files from this folder:
+     - `bootloader.bin`
+     - `partitions.bin`
+     - `firmware.bin`
+   - Save them to your computer in an easy-to-find location
+
+2. **Open the web flasher:**
+   - Go to: https://esptool.spacehuhn.com/
+   - Use **Google Chrome** or **Microsoft Edge** (other browsers may not work)
+
+3. **Connect your ESP32-CAM:**
+   - Plug the ESP32-CAM into your computer via USB cable
+   - Wait 1-2 seconds for the device to be recognized
+
+4. **Select the COM port:**
+   - Click the dropdown menu in the web tool (usually says "Select a device")
+   - Choose your ESP32-CAM device (often shows as "USB JTAG/serial debug unit" or "COM9")
+   - If you don't see it, try a different USB cable or USB port
+
+5. **Add firmware files:**
+   - You will see fields for different memory addresses. Fill them in as follows:
+
+   | Address | File | 
+   |---------|------|
+   | 0x1000 | Select `bootloader.bin` |
+   | 0x8000 | Select `partitions.bin` |
+   | 0x10000 | Select `firmware.bin` |
+
+   **How to add files:**
+   - Click on each address field
+   - Click "Browse" or the file selector button
+   - Navigate to and select the corresponding `.bin` file
+
+6. **Configure flash settings:**
+   - **Baud Rate:** 460800 (usually pre-selected)
+   - **Flash Mode:** DIO
+   - **Flash Frequency:** 40MHz
+   - **Flash Size:** Keep auto-detected or set to 4MB
+
+7. **Start flashing:**
+   - Click the "Program" or "Flash" button
+   - Wait for the progress bar to complete (usually 10-30 seconds)
+   - You should see a success message when done
+
+8. **Verify successful flash:**
+   - The device should reboot automatically
+   - Check the LED on the ESP32-CAM (should blink briefly)
+   - If you see errors, try again at 115200 baud rate
+
+**Troubleshooting:**
+
+- **Device not detected:** Try a different USB port or cable
+- **Connection timeout:** Disconnect and reconnect the USB cable, then refresh the browser
+- **Permission denied error:** Close any other programs using the COM port
+- **Flashing failed:** Retry at 115200 baud rate instead of 460800
+
+**Browser Requirements:**
+- ✅ Google Chrome (recommended)
+- ✅ Microsoft Edge (Chromium-based)
+- ❌ Firefox (WebSerial not supported)
+- ❌ Safari (WebSerial not supported)
+
 ## First Time Setup
 
 After flashing, the device will:

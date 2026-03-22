@@ -60,18 +60,41 @@ See [VERSIONS_COMPARISON.md](VERSIONS_COMPARISON.md) for detailed comparison.
 
 ## 🚀 Getting Started
 
+### ⚡ Quick Flash (No Installation Required)
+
+**Easiest Method - Use Web Browser:**
+
+1. Download the **firmware files** from the [firmware_release/](firmware_release/) folder:
+   - `bootloader.bin`
+   - `partitions.bin`
+   - `firmware.bin`
+
+2. Go to: **https://esptool.spacehuhn.com/** (works in Chrome or Edge)
+
+3. Plug in your ESP32-CAM via USB cable
+
+4. Select the COM port from the dropdown
+
+5. Add the firmware files with these addresses:
+   - `bootloader.bin` → **0x1000**
+   - `partitions.bin` → **0x8000**
+   - `firmware.bin` → **0x10000**
+
+6. Click **Program** and wait for success ✅
+
+👉 See [firmware_release/FLASH_INSTRUCTIONS.md](firmware_release/FLASH_INSTRUCTIONS.md) for detailed step-by-step guide and alternative methods.
+
 ### Prerequisites
 - PlatformIO (recommended) or Arduino IDE
 - Python 3.x (for control scripts)
 - WiFi network (or use Access Point mode)
 
-### Installation
+### Installation (For Development)
 
-1. **Flash Firmware**
+1. **Flash Firmware** (from source code)
    ```bash
    platformio run --target upload
    ```
-   See [firmware_release/FLASH_INSTRUCTIONS.md](firmware_release/FLASH_INSTRUCTIONS.md) for detailed flashing instructions.
 
 2. **Install Python Dependencies**
    ```bash

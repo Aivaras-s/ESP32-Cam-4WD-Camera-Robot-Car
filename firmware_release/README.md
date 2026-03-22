@@ -5,6 +5,25 @@ Complete firmware package for ESP32-CAM based 4-wheel drive robot with camera st
 
 ## Quick Start
 
+### 🌐 Web-Based Flashing (Easiest - No Installation!)
+
+**Use your browser to flash directly:**
+
+1. Open **https://esptool.spacehuhn.com/** (Chrome or Edge required)
+2. Plug in your ESP32-CAM via USB
+3. Select the device from the dropdown
+4. Add files at these addresses:
+   - `bootloader.bin` → **0x1000**
+   - `partitions.bin` → **0x8000**
+   - `firmware.bin` → **0x10000**
+5. Click **Program** ✅
+
+**For complete instructions,** see `FLASH_INSTRUCTIONS.md` (Option 4: Web-based esptool.spacehuhn.com)
+
+---
+
+### Command-Line Flashing
+
 1. **Flash the firmware** using one of these methods:
    - See `FLASH_INSTRUCTIONS.md` for detailed steps
    - Recommended: esptool.py command-line tool
@@ -16,6 +35,28 @@ Complete firmware package for ESP32-CAM based 4-wheel drive robot with camera st
    - Open browser: http://192.168.4.1
 
 3. **Configure WiFi** and start using your robot!
+
+## 📦 GitHub Release
+
+**Pre-built Firmware Files** are available in GitHub Releases for quick flashing without compilation.
+
+### Release Contents
+- ✅ **bootloader.bin** - ESP32 bootloader
+- ✅ **partitions.bin** - Partition table (OTA enabled)
+- ✅ **firmware.bin** - Main application firmware (1.9MB app partition)
+- 📖 **FLASH_INSTRUCTIONS.md** - Complete flashing guide
+- 📋 **README.md** - Quick reference
+
+### How to Use Release Files
+
+**For Windows/Mac/Linux users:**
+1. Download the three `.bin` files from GitHub Release
+2. Open https://esptool.spacehuhn.com/ in Chrome or Edge
+3. Connect your ESP32-CAM
+4. Select the three files with addresses shown above
+5. Click Program
+
+**No compilation needed!** The firmware is ready to flash directly onto your device.
 
 ## Package Contents
 
