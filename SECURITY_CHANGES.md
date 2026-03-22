@@ -3,6 +3,8 @@
 ## Overview
 This document outlines security improvements made to the codebase to ensure sensitive information is properly managed and the code is safe to push to a public GitHub repository.
 
+**Note:** The project uses mDNS hostname `esp32-cam-4wd.local` for easy device discovery - no IP addresses needed for most users!
+
 ## Changes Made
 
 ### 1. Unified Password Management ✅

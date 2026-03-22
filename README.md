@@ -84,19 +84,33 @@ See [VERSIONS_COMPARISON.md](VERSIONS_COMPARISON.md) for detailed comparison.
 
 ### Quick Control Examples
 
+**Easy Way (Recommended for Beginners):**
+```bash
+# You can use the mDNS hostname directly (no need to find IP!)
+python udp_video_viewer.py esp32-cam-4wd.local
+python test_udp_control.py esp32-cam-4wd.local
+```
+
+**Or use your robot's IP address:**
+```bash
+# Replace 192.168.X.X with your actual robot IP
+python udp_video_viewer.py 192.168.X.X
+python test_udp_control.py 192.168.X.X
+```
+
 #### UDP Video Streaming
 ```bash
-python udp_video_viewer.py 192.168.X.X
+python udp_video_viewer.py esp32-cam-4wd.local
 ```
 
 #### UDP Joystick Control
 ```bash
-python test_udp_joystick.py 192.168.X.X
+python test_udp_joystick.py esp32-cam-4wd.local
 ```
 
 #### Keyboard Control
 ```bash
-python test_udp_control.py 192.168.X.X
+python test_udp_control.py esp32-cam-4wd.local
 ```
 
 See [JOYSTICK_GUIDE.md](JOYSTICK_GUIDE.md) for detailed control instructions.
@@ -130,10 +144,18 @@ See [JOYSTICK_GUIDE.md](JOYSTICK_GUIDE.md) for detailed control instructions.
 - **AP Mode** - Create own WiFi network for setup
 - **Both** - Check [SECURITY_CHANGES.md](SECURITY_CHANGES.md) for details
 
+### Easy Device Access (mDNS)
+Once connected to WiFi, access your robot using the **mDNS hostname**:
+```
+http://esp32-cam-4wd.local
+```
+
+No need to find the IP address! Just use this link in any browser on the same network.
+
 ### Configuration
 
 WiFi credentials are stored in device preferences. To reconfigure:
-1. Access web interface at `http://robot-ip/`
+1. Access web interface at `http://esp32-cam-4wd.local/`
 2. Go to setup page
 3. Enter new WiFi credentials
 

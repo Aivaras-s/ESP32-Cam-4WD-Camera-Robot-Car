@@ -132,22 +132,41 @@ This is the traditional ESP-IDF implementation with the new analog joystick cont
 
 ## Access Points
 
-### Web Interface:
+### Web Interface (Easy Way - Using mDNS Hostname):
 ```
-http://192.168.220.231       # Main control page (all versions)
+http://esp32-cam-4wd.local       # Main control page (all versions)
+http://esp32-cam-4wd.local:81    # Stream only (Version 1)
+ws://esp32-cam-4wd.local/ws      # WebSocket (Version 2 only)
+```
+
+### Web Interface (Using IP Address):
+```
+http://192.168.220.231       # Replace with your robot's IP
 http://192.168.220.231:81    # Stream only (Version 1)
 ws://192.168.220.231/ws      # WebSocket (Version 2 only)
 ```
 
-### UDP Control:
+### UDP Control (Easy Way - Using mDNS):
+```powershell
+python test_udp_control.py esp32-cam-4wd.local
+```
+
+### UDP Control (Using IP):
 ```powershell
 python test_udp_control.py 192.168.220.231
 ```
 
-### UDP Video (Version 2 only):
+### UDP Video - Version 2 (Easy Way - Using mDNS):
+```powershell
+python udp_video_viewer.py esp32-cam-4wd.local
+```
+
+### UDP Video - Version 2 (Using IP):
 ```powershell
 python udp_video_viewer.py 192.168.220.231
 ```
+
+**💡 For Beginners:** Use `esp32-cam-4wd.local` - no need to find your robot's IP address!
 
 ---
 

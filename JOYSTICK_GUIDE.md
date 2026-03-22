@@ -6,9 +6,18 @@ The ESP32-CAM web interface now features an **analog virtual joystick** for smoo
 ## How to Use
 
 ### Access the Interface
+**Easy way (recommended for beginners):**
 Open in your browser:
 ```
-http://<YOUR_ESP32_IP>
+http://esp32-cam-4wd.local
+```
+
+No need to find the IP address! This works on any device on your WiFi network.
+
+**Or use the robot's IP address:**
+If the hostname doesn't work, find your robot's IP from your router and use:
+```
+http://192.168.X.X
 ```
 
 ### Joystick Controls

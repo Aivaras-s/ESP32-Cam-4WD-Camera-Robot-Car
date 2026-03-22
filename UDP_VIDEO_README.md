@@ -13,11 +13,23 @@ pip install opencv-python numpy
 ## Usage
 
 ### 1. Start UDP Video Viewer
+**Easy way (recommended - no need to find IP):**
+```powershell
+python udp_video_viewer.py esp32-cam-4wd.local
+```
+
+**Or with IP address:**
 ```powershell
 python udp_video_viewer.py 192.168.220.231
 ```
 
 ### 2. Control Robot (separate terminal)
+**Easy way (recommended):**
+```powershell
+python test_udp_control.py esp32-cam-4wd.local
+```
+
+**Or with IP address:**
 ```powershell
 python test_udp_control.py 192.168.220.231
 ```
@@ -59,7 +71,8 @@ python test_udp_control.py 192.168.220.231
 
 ### No video appearing:
 - Check firewall allows UDP port 8889
-- Verify ESP32-CAM IP address: `192.168.220.231`
+- Try using mDNS hostname: `esp32-cam-4wd.local` (easier than finding IP)
+- If hostname doesn't work, find your robot's IP from router settings
 - Check serial output for "[VIDEO] Client connected" message
 
 ### Choppy video:
