@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ESP32-CAM UDP Control Tester</title>
+  <meta charset="UTF-8">
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 600px;
+      margin: 50px auto;
+      padding: 20px;
+      background: #f0f0f0;
+    }
+    h1 {
+      color: #333;
+      text-align: center;
+    }
+    .info {
+      background: #fff;
+      padding: 20px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .warning {
+      background: #fff3cd;
+      border: 1px solid #ffc107;
+      padding: 15px;
+      border-radius: 5px;
+      margin: 20px 0;
+    }
+    code {
+      background: #f5f5f5;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-family: 'Courier New', monospace;
+    }
+    .command-list {
+      background: #e8f4f8;
+      padding: 15px;
+      border-radius: 5px;
+      margin-top: 15px;
+    }
+    .command-list h3 {
+      margin-top: 0;
+      color: #0066cc;
+    }
+    ul {
+      margin: 10px 0;
+      padding-left: 20px;
+    }
+    li {
+      margin: 5px 0;
+    }
+  </style>
+</head>
+<body>
+  <h1>ESP32-CAM UDP Control Tester</h1>
+  
+  <div class="warning">
+    <strong>⚠️ Browser Limitation:</strong> Web browsers cannot directly send UDP packets due to security restrictions. 
+    UDP testing must be done using external tools.
+  </div>
+
+  <div class="info">
+    <h2>Testing UDP Control</h2>
+    <p>Your ESP32-CAM is now listening for UDP commands on <strong>Port 8888</strong>.</p>
+    
+    <h3>Method 1: Python Script (Recommended)</h3>
+    <p>Use the included <code>test_udp_control.py</code> script:</p>
+    <pre><code>python test_udp_control.py YOUR_ESP32_IP</code></pre>
+    
+    <h3>Method 2: Command Line (Linux/Mac)</h3>
+    <pre><code>echo "FWD" | nc -u -w1 YOUR_ESP32_IP 8888</code></pre>
+    
+    <h3>Method 3: Command Line (Windows PowerShell)</h3>
+    <pre><code>$udpClient = New-Object System.Net.Sockets.UdpClient
+$bytes = [System.Text.Encoding]::ASCII.GetBytes("FWD")
+$udpClient.Send($bytes, $bytes.Length, "YOUR_ESP32_IP", 8888)
+$udpClient.Close()</code></pre>
+
+    <h3>Method 4: Mobile Apps</h3>
+    <ul>
+      <li><strong>Android:</strong> "UDP Sender" or "Network Analyzer"</li>
+      <li><strong>iOS:</strong> "UDP Test Tool" or "Network Utility"</li>
+    </ul>
+  </div>
+
+  <div class="command-list">
+    <h3>Available Commands:</h3>
+    <ul>
+      <li><code>FWD</code> - Move forward</li>
+      <li><code>BWD</code> - Move backward</li>
+      <li><code>LEFT</code> - Turn left</li>
+      <li><code>RIGHT</code> - Turn right</li>
+      <li><code>STOP</code> - Stop motors</li>
+      <li><code>LED_ON</code> - Turn LED on</li>
+      <li><code>LED_OFF</code> - Turn LED off</li>
+      <li><code>SPEED+</code> - Increase speed</li>
+      <li><code>SPEED-</code> - Decrease speed</li>
+      <li><code>REBOOT</code> - Reboot ESP32</li>
+    </ul>
+  </div>
+
+  <div class="info">
+    <h3>Why UDP?</h3>
+    <p><strong>UDP (User Datagram Protocol)</strong> is ideal for robot control because:</p>
+    <ul>
+      <li>✅ Lower latency - No connection handshake</li>
+      <li>✅ Works better on congested networks</li>
+      <li>✅ Lighter weight than TCP</li>
+      <li>✅ No connection state to maintain</li>
+      <li>✅ Can penetrate some firewall/NAT scenarios better</li>
+    </ul>
+    <p><strong>When to use UDP:</strong> When you experience lag or connection drops with the web interface (HTTP/TCP)</p>
+  </div>
+
+  <div class="info">
+    <h3>Connection Info:</h3>
+    <p>Get your ESP32 IP address from the serial monitor or the web interface.</p>
+    <p><strong>UDP Port:</strong> 8888</p>
+    <p><strong>Web Interface:</strong> http://YOUR_ESP32_IP</p>
+    <p><strong>Video Stream:</strong> http://YOUR_ESP32_IP:81/stream</p>
+  </div>
+</body>
+</html>

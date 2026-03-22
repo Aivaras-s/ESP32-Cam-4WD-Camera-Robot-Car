@@ -1,0 +1,1066 @@
+/*
+  ESP32-CAM Robot - Based on CameraWebServer Example
+  Added: Motor control for robot
+*/
+
+#include <Arduino.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include "esp_timer.h"
+#include "img_converters.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "esp_http_server.h"
+
+// Debug control - set to 0 to disable all debug output
+#define DEBUG_ENABLED 0
+
+// WiFi credentials
+const char *ssid = "Susitiko zirnis pupa";
+const char *password = "Pizdukas1";
+
+// Camera pins (AI-Thinker ESP32-CAM)
+#define PWDN_GPIO_NUM 32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 0
+#define SIOD_GPIO_NUM 26
+#define SIOC_GPIO_NUM 27
+#define Y9_GPIO_NUM 35
+#define Y8_GPIO_NUM 34
+#define Y7_GPIO_NUM 39
+#define Y6_GPIO_NUM 36
+#define Y5_GPIO_NUM 21
+#define Y4_GPIO_NUM 19
+#define Y3_GPIO_NUM 18
+#define Y2_GPIO_NUM 5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM 23
+#define PCLK_GPIO_NUM 22
+
+// Motor pins
+#define MOTOR_R_PIN_1 14
+#define MOTOR_R_PIN_2 15
+#define MOTOR_L_PIN_1 13
+#define MOTOR_L_PIN_2 12
+#define LED_GPIO_NUM 4
+
+// Motor speed
+int motorSpeed = 170;
+
+// HTTP ports
+#define HTTP_PORT 80
+#define STREAM_PORT 81
+
+// UDP Control Port
+#define UDP_CONTROL_PORT 8888
+
+// Power saving
+volatile bool clientConnected = false;
+volatile unsigned long lastClientActivity = 0;
+#define IDLE_TIMEOUT_MS 30000  // 30 seconds of inactivity
+
+// Motor watchdog - safety feature to stop motors if commands stop
+volatile unsigned long lastMotorCommand = 0;
+#define MOTOR_WATCHDOG_TIMEOUT_MS 1000  // 1 second
+volatile bool motorsActive = false;
+
+// HTTP streaming
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char *_STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char *_STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char *_STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\nX-Timestamp: %d.%06d\r\n\r\n";
+
+httpd_handle_t camera_httpd = NULL;
+httpd_handle_t stream_httpd = NULL;
+
+// UDP server
+WiFiUDP udpServer;
+
+// Forward declarations
+void startCameraServer();
+void processCommand(const char* cmd);
+
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  // Initialize motor pins
+  pinMode(MOTOR_R_PIN_1, OUTPUT);
+  pinMode(MOTOR_R_PIN_2, OUTPUT);
+  pinMode(MOTOR_L_PIN_1, OUTPUT);
+  pinMode(MOTOR_L_PIN_2, OUTPUT);
+  pinMode(LED_GPIO_NUM, OUTPUT);
+
+  #if DEBUG_ENABLED
+    Serial.begin(115200);
+    Serial.setDebugOutput(true);
+    Serial.println();
+  #endif
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.frame_size = FRAMESIZE_UXGA;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+
+  // if PSRAM IC present, init with UXGA resolution and higher JPEG quality
+  if (config.pixel_format == PIXFORMAT_JPEG) {
+    if (psramFound()) {
+      config.jpeg_quality = 10;
+      config.fb_count = 2;
+      config.grab_mode = CAMERA_GRAB_LATEST;
+    } else {
+      config.frame_size = FRAMESIZE_SVGA;
+      config.fb_location = CAMERA_FB_IN_DRAM;
+    }
+  }
+
+  // camera init
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    #if DEBUG_ENABLED
+      Serial.printf("Camera init failed with error 0x%x", err);
+    #endif
+    return;
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  // drop down frame size for higher initial frame rate
+  if (config.pixel_format == PIXFORMAT_JPEG) {
+    s->set_framesize(s, FRAMESIZE_QVGA);
+  }
+  s->set_vflip(s, 1);
+
+  WiFi.begin(ssid, password);
+  WiFi.setSleep(false);
+
+  #if DEBUG_ENABLED
+    Serial.print("WiFi connecting");
+  #endif
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    #if DEBUG_ENABLED
+      Serial.print(".");
+    #endif
+  }
+  
+  #if DEBUG_ENABLED
+    Serial.println("");
+    Serial.println("WiFi connected");
+  #endif
+
+  startCameraServer();
+
+  // Start UDP server
+  udpServer.begin(UDP_CONTROL_PORT);
+
+  #if DEBUG_ENABLED
+    Serial.print("Camera Ready! Use 'http://");
+    Serial.print(WiFi.localIP());
+    Serial.println("' to connect");
+    Serial.print("UDP Control Port: ");
+    Serial.println(UDP_CONTROL_PORT);
+  #endif
+}
+
+void loop() {
+  // Handle UDP control packets
+  int packetSize = udpServer.parsePacket();
+  if (packetSize) {
+    char incomingPacket[32];
+    int len = udpServer.read(incomingPacket, sizeof(incomingPacket) - 1);
+    if (len > 0) {
+      incomingPacket[len] = '\0';  // Null-terminate the string
+      
+      #if DEBUG_ENABLED
+        Serial.printf("[UDP] Received: %s from %s:%d\n", 
+                      incomingPacket, 
+                      udpServer.remoteIP().toString().c_str(), 
+                      udpServer.remotePort());
+      #endif
+      
+      processCommand(incomingPacket);
+      
+      // Send acknowledgment back to sender
+      udpServer.beginPacket(udpServer.remoteIP(), udpServer.remotePort());
+      udpServer.write((const uint8_t*)"OK", 2);
+      udpServer.endPacket();
+      
+      // Update activity for power saving
+      lastClientActivity = millis();
+    }
+  }
+  
+  // Motor watchdog: Stop motors if no commands received for 1 second
+  if (motorsActive && (millis() - lastMotorCommand > MOTOR_WATCHDOG_TIMEOUT_MS)) {
+    #if DEBUG_ENABLED
+      Serial.println("[WATCHDOG] No motor commands for 1s - EMERGENCY STOP!");
+    #endif
+    analogWrite(MOTOR_R_PIN_1, 0);
+    analogWrite(MOTOR_R_PIN_2, 0);
+    analogWrite(MOTOR_L_PIN_1, 0);
+    analogWrite(MOTOR_L_PIN_2, 0);
+    motorsActive = false;
+  }
+  
+  // Power saving: Monitor client activity
+  static unsigned long lastIdleCheck = 0;
+  static bool wasIdle = false;
+  
+  if (millis() - lastIdleCheck > 5000) {  // Check every 5 seconds
+    lastIdleCheck = millis();
+    
+    bool isIdle = !clientConnected && (millis() - lastClientActivity > IDLE_TIMEOUT_MS);
+    
+    if (isIdle && !wasIdle) {
+      #if DEBUG_ENABLED
+        Serial.println("[POWER SAVE] No clients for 30s - entering low power mode");
+        Serial.println("[POWER SAVE] WiFi still active, motors disabled, camera on standby");
+      #endif
+      
+      // Stop motors if running
+      analogWrite(MOTOR_R_PIN_1, 0);
+      analogWrite(MOTOR_R_PIN_2, 0);
+      analogWrite(MOTOR_L_PIN_1, 0);
+      analogWrite(MOTOR_L_PIN_2, 0);
+      motorsActive = false;
+      
+      // Turn off LED
+      digitalWrite(LED_GPIO_NUM, LOW);
+      
+      wasIdle = true;
+    } else if (!isIdle && wasIdle) {
+      #if DEBUG_ENABLED
+        Serial.println("[POWER SAVE] Client activity detected - resuming normal operation");
+      #endif
+      wasIdle = false;
+    }
+    
+    // Memory status logging
+    #if DEBUG_ENABLED
+      if (!wasIdle) {
+        Serial.printf("[STATUS] Heap: %d, PSRAM: %d, Client: %s, Motors: %s\n", 
+                      ESP.getFreeHeap(), 
+                      ESP.getFreePsram(),
+                      clientConnected ? "Connected" : "Idle",
+                      motorsActive ? "Active" : "Stopped");
+      }
+    #endif
+  }
+  
+  delay(100);
+}
+
+// Process control commands
+void processCommand(const char* cmd) {
+  if (strcmp(cmd, "FWD") == 0) {
+    lastMotorCommand = millis();
+    motorsActive = true;
+    analogWrite(MOTOR_R_PIN_1, 0);
+    analogWrite(MOTOR_R_PIN_2, motorSpeed);
+    analogWrite(MOTOR_L_PIN_1, motorSpeed);
+    analogWrite(MOTOR_L_PIN_2, 0);
+  }
+  else if (strcmp(cmd, "BWD") == 0) {
+    lastMotorCommand = millis();
+    motorsActive = true;
+    analogWrite(MOTOR_R_PIN_1, motorSpeed);
+    analogWrite(MOTOR_R_PIN_2, 0);
+    analogWrite(MOTOR_L_PIN_1, 0);
+    analogWrite(MOTOR_L_PIN_2, motorSpeed);
+  }
+  else if (strcmp(cmd, "LEFT") == 0) {
+    lastMotorCommand = millis();
+    motorsActive = true;
+    analogWrite(MOTOR_R_PIN_1, 0);
+    analogWrite(MOTOR_R_PIN_2, motorSpeed);
+    analogWrite(MOTOR_L_PIN_1, 0);
+    analogWrite(MOTOR_L_PIN_2, motorSpeed);
+  }
+  else if (strcmp(cmd, "RIGHT") == 0) {
+    lastMotorCommand = millis();
+    motorsActive = true;
+    analogWrite(MOTOR_R_PIN_1, motorSpeed);
+    analogWrite(MOTOR_R_PIN_2, 0);
+    analogWrite(MOTOR_L_PIN_1, motorSpeed);
+    analogWrite(MOTOR_L_PIN_2, 0);
+  }
+  else if (strcmp(cmd, "STOP") == 0) {
+    motorsActive = false;
+    analogWrite(MOTOR_R_PIN_1, 0);
+    analogWrite(MOTOR_R_PIN_2, 0);
+    analogWrite(MOTOR_L_PIN_1, 0);
+    analogWrite(MOTOR_L_PIN_2, 0);
+  }
+  else if (strcmp(cmd, "LED_ON") == 0) {
+    digitalWrite(LED_GPIO_NUM, HIGH);
+  }
+  else if (strcmp(cmd, "LED_OFF") == 0) {
+    digitalWrite(LED_GPIO_NUM, LOW);
+  }
+  else if (strcmp(cmd, "SPEED+") == 0) {
+    motorSpeed = constrain(motorSpeed + 85, 85, 255);
+  }
+  else if (strcmp(cmd, "SPEED-") == 0) {
+    motorSpeed = constrain(motorSpeed - 85, 85, 255);
+  }
+  else if (strcmp(cmd, "REBOOT") == 0) {
+    #if DEBUG_ENABLED
+      Serial.println("Rebooting...");
+    #endif
+    delay(100);
+    ESP.restart();
+  }
+}
+
+// Web interface
+static const char PROGMEM INDEX_HTML[] = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ESP32-CAM Robot</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta charset="UTF-8">
+  <style>
+    * {
+      -webkit-tap-highlight-color: transparent;
+      -webkit-touch-callout: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, Arial, sans-serif;
+      text-align: center;
+      margin: 0;
+      padding: 10px;
+      background: #1a1a1a;
+      color: #fff;
+      touch-action: manipulation;
+    }
+    h1 {
+      font-size: 24px;
+      margin: 10px 0;
+      color: #4a9eff;
+    }
+    .badge {
+      display: inline-block;
+      background: #27ae60;
+      color: white;
+      padding: 5px 10px;
+      border-radius: 5px;
+      font-size: 12px;
+      margin: 5px;
+    }
+    .badge.http { background: #3498db; }
+    .badge.udp { background: #9b59b6; }
+    #photo {
+      width: 100%;
+      max-width: 640px;
+      height: auto;
+      border: 2px solid #2f4468;
+      border-radius: 8px;
+      margin: 10px auto;
+      display: block;
+      background: #000;
+    }
+    .reboot-button {
+      width: 85px;
+      height: 85px;
+      background: linear-gradient(145deg, #e74c3c, #c0392b);
+      color: white;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+      font-size: 16px;
+      font-weight: bold;
+      touch-action: manipulation;
+      transition: all 0.1s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+    }
+    .quality-button {
+      background: linear-gradient(145deg, #3498db, #2980b9);
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: bold;
+      touch-action: manipulation;
+      transition: all 0.1s ease;
+      padding: 5px 10px;
+      display: inline-block;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+    }
+    .quality-button.high {
+      background: linear-gradient(145deg, #27ae60, #219a52);
+    }
+    .status-bar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: #2c3e50;
+      padding: 10px;
+      color: white;
+      font-size: 12px;
+      display: flex;
+      justify-content: space-around;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .wifi-strong { color: #27ae60; }
+    .wifi-medium { color: #f1c40f; }
+    .wifi-weak { color: #e74c3c; }
+    .latency-good { color: #27ae60; }
+    .latency-medium { color: #f1c40f; }
+    .latency-poor { color: #e74c3c; }
+    .button-container {
+      display: grid;
+      grid-template-areas:
+        "reboot forward led"
+        "left stop right"
+        "plus backward minus";
+      grid-gap: 8px;
+      justify-content: center;
+      max-width: 320px;
+      margin: 20px auto;
+      padding: 10px;
+    }
+    .reboot-button { 
+      grid-area: reboot; 
+      width: 85px;
+      height: 85px;
+      background: linear-gradient(145deg, #e74c3c, #c0392b);
+      color: white;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: bold;
+      touch-action: manipulation;
+      transition: all 0.1s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+    }
+    .reboot-button:active {
+      transform: scale(0.95);
+    }
+    .button, .led-button {
+      border: none;
+      text-align: center;
+      font-size: 20px;
+      cursor: pointer;
+      width: 85px;
+      height: 85px;
+      border-radius: 12px;
+      touch-action: manipulation;
+      transition: all 0.1s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: bold;
+      box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+    }
+    .button {
+      background: linear-gradient(145deg, #2f4468, #1e2d47);
+      color: white;
+    }
+    .button:active {
+      transform: scale(0.95);
+    }
+    .led-button {
+      background: linear-gradient(145deg, #555, #444);
+      color: white;
+    }
+    .led-on {
+      background: linear-gradient(145deg, #ffd700, #f0c40f);
+      color: #000;
+    }
+    .forward { grid-area: forward; }
+    .led { grid-area: led; font-size: 16px; }
+    .left { grid-area: left; }
+    .stop { grid-area: stop; background: #c0392b; font-size: 32px; }
+    .right { grid-area: right; }
+    .backward { grid-area: backward; }
+    .plus { grid-area: plus; font-size: 28px; }
+    .minus { grid-area: minus; font-size: 28px; }
+    .info {
+      margin: 10px;
+      font-size: 14px;
+      color: #4a9eff;
+    }
+    select {
+      background: #2f4468;
+      color: white;
+      border: 1px solid #4a9eff;
+      border-radius: 6px;
+      padding: 8px;
+      font-size: 14px;
+      cursor: pointer;
+      margin: 10px;
+    }
+  </style>
+</head>
+<body>
+  <h1>ESP32-CAM Robot Control</h1>
+  <div>
+    <span class="badge http">HTTP: Port 80</span>
+    <span class="badge http">Stream: Port 81</span>
+    <span class="badge udp">UDP: Port 8888</span>
+  </div>
+  
+  <img src="" id="photo" alt="Camera Stream">
+  
+  <div class="info">
+    <label for="resolution">Resolution: </label>
+    <select id="resolution">
+      <option value="5">QVGA (320x240) - Default</option>
+      <option value="6">CIF (400x296)</option>
+      <option value="8">VGA (640x480)</option>
+      <option value="9">SVGA (800x600)</option>
+      <option value="10">XGA (1024x768)</option>
+      <option value="11">HD (1280x720)</option>
+      <option value="12">SXGA (1280x1024)</option>
+      <option value="13">UXGA (1600x1200)</option>
+    </select>
+  </div>
+  
+  <div class="info">Speed: <span id="speedText">Medium</span></div>
+
+  <div class="button-container">
+    <button id="rebootButton" class="reboot-button">REBOOT</button>
+    <button class="button forward" data-action="FWD">↑</button>
+    <button id="ledButton" class="led-button led" data-action="led">OFF</button>
+    <button class="button left" data-action="LEFT">←</button>
+    <button class="button stop" data-action="STOP">●</button>
+    <button class="button right" data-action="RIGHT">→</button>
+    <button class="button plus" data-action="SPEED+">+</button>
+    <button class="button backward" data-action="BWD">↓</button>
+    <button class="button minus" data-action="SPEED-">−</button>
+  </div>
+
+  <div class="status-bar">
+    <div id="wifiStatus">WiFi: --</div>
+    <div id="latencyStatus">Latency: --</div>
+  </div>
+
+  <script>
+    const imgElement = document.getElementById('photo');
+    imgElement.style.display = 'block';
+    const wifiStatusEl = document.getElementById('wifiStatus');
+    const latencyStatusEl = document.getElementById('latencyStatus');
+
+    document.addEventListener('touchstart', (e) => {
+      if (e.target.tagName === 'BUTTON') e.preventDefault();
+    }, { passive: false });
+    document.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+
+    // Resolution selector
+    const resolutionSelect = document.getElementById('resolution');
+    resolutionSelect.addEventListener('change', function() {
+      fetch('/action?framesize=' + this.value)
+        .then(() => {
+          setTimeout(() => startStream(), 500);
+        });
+    });
+
+    // Start HTTP stream
+    function startStream() {
+      imgElement.src = 'http://' + window.location.hostname + ':81/stream?' + Date.now();
+    }
+    
+    // Handle HTTP stream errors and auto-reconnect
+    imgElement.addEventListener('error', function() {
+      setTimeout(() => {
+        imgElement.src = 'http://' + window.location.hostname + ':81/stream?' + Date.now();
+      }, 1000);
+    });
+
+    // Connection quality monitoring
+    function checkConnection() {
+      const startTime = performance.now();
+      fetch('/action?cmd=ping')
+        .then(response => {
+          const latency = performance.now() - startTime;
+          updateLatencyStatus(latency);
+        });
+    }
+
+    function updateLatencyStatus(latency) {
+      let status = '';
+      let className = '';
+      
+      if (latency < 100) {
+        status = 'Good';
+        className = 'latency-good';
+      } else if (latency < 300) {
+        status = 'Medium';
+        className = 'latency-medium';
+      } else {
+        status = 'Poor';
+        className = 'latency-poor';
+      }
+
+      latencyStatusEl.textContent = `Latency: ${Math.round(latency)}ms (${status})`;
+      latencyStatusEl.className = className;
+    }
+
+    // WiFi signal strength monitoring
+    function updateWifiStatus() {
+      fetch('/wifi-status')
+        .then(response => response.json())
+        .then(data => {
+          let strength = '';
+          let className = '';
+          
+          if (data.rssi > -50) {
+            strength = 'Excellent';
+            className = 'wifi-strong';
+          } else if (data.rssi > -70) {
+            strength = 'Good';
+            className = 'wifi-medium';
+          } else {
+            strength = 'Weak';
+            className = 'wifi-weak';
+          }
+
+          wifiStatusEl.textContent = `WiFi: ${strength} (${data.rssi}dBm)`;
+          wifiStatusEl.className = className;
+        })
+        .catch(err => {
+          wifiStatusEl.textContent = 'WiFi: Disconnected';
+          wifiStatusEl.className = 'wifi-weak';
+        });
+    }    function sendCommand(cmd) {
+      const xhr = new XMLHttpRequest();
+      xhr.timeout = 500;
+      xhr.open('GET', '/action?cmd=' + cmd, true);
+      xhr.send();
+    }
+
+    // Motor command repeat system
+    let activeMotorCommand = null;
+    let motorCommandInterval = null;
+
+    function startMotorCommand(cmd) {
+      activeMotorCommand = cmd;
+      sendCommand(cmd);
+      
+      // Send command every 800ms while button is held
+      if (motorCommandInterval) clearInterval(motorCommandInterval);
+      motorCommandInterval = setInterval(() => {
+        if (activeMotorCommand) {
+          sendCommand(activeMotorCommand);
+        }
+      }, 800);  // 800ms - less than 1 second watchdog timeout
+    }
+
+    function stopMotorCommand() {
+      activeMotorCommand = null;
+      if (motorCommandInterval) {
+        clearInterval(motorCommandInterval);
+        motorCommandInterval = null;
+      }
+      sendCommand('STOP');
+    }
+
+    window.onload = function() {
+      // Start video stream
+      imgElement.src = 'http://' + window.location.hostname + ':81/stream';
+      
+      // Start connection monitoring
+      setInterval(checkConnection, 1000);  // Check connection every second
+      setInterval(updateWifiStatus, 5000); // Update WiFi status every 5 seconds
+      
+      // Initial status updates
+      updateWifiStatus();
+      checkConnection();
+      
+      // Reload stream if it fails to load
+      imgElement.onerror = function() {
+        setTimeout(() => {
+          imgElement.src = 'http://' + window.location.hostname + ':81/stream?' + Date.now();
+        }, 1000);
+      };
+    };
+
+    let currentSpeed = 170;
+    const speedLevels = { 85: 'Low', 170: 'Medium', 255: 'High' };
+
+    function updateSpeedDisplay() {
+      document.getElementById('speedText').textContent = speedLevels[currentSpeed] || 'Medium';
+    }
+
+    let ledState = false;
+    const ledButton = document.getElementById('ledButton');
+
+    ['click', 'touchstart'].forEach(evt => {
+      ledButton.addEventListener(evt, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        ledState = !ledState;
+        ledButton.classList.toggle('led-on', ledState);
+        ledButton.textContent = ledState ? 'ON' : 'OFF';
+        sendCommand(ledState ? 'LED_ON' : 'LED_OFF');
+      }, { passive: false });
+    });
+
+    // Reboot button handler
+    const rebootButton = document.getElementById('rebootButton');
+    ['click', 'touchend'].forEach(evt => {
+      rebootButton.addEventListener(evt, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (confirm('Reboot ESP32-CAM?')) {
+          sendCommand('REBOOT');
+        }
+      }, { passive: false });
+    });
+
+    const buttons = document.querySelectorAll('.button[data-action]');
+    buttons.forEach(button => {
+      const action = button.getAttribute('data-action');
+      
+      // Mouse events
+      button.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        if (action === 'SPEED+' || action === 'SPEED-') return;
+        if (action === 'FWD' || action === 'BWD' || action === 'LEFT' || action === 'RIGHT') {
+          startMotorCommand(action);
+        } else {
+          sendCommand(action);
+        }
+      });
+
+      button.addEventListener('mouseup', (e) => {
+        e.preventDefault();
+        if (action === 'SPEED+') {
+          currentSpeed = Math.min(currentSpeed + 85, 255);
+          updateSpeedDisplay();
+          sendCommand(action);
+        } else if (action === 'SPEED-') {
+          currentSpeed = Math.max(currentSpeed - 85, 85);
+          updateSpeedDisplay();
+          sendCommand(action);
+        } else if (action === 'FWD' || action === 'BWD' || action === 'LEFT' || action === 'RIGHT') {
+          stopMotorCommand();
+        } else if (action === 'STOP') {
+          stopMotorCommand();
+        }
+      });
+
+      button.addEventListener('mouseleave', (e) => {
+        if (action === 'FWD' || action === 'BWD' || action === 'LEFT' || action === 'RIGHT') {
+          stopMotorCommand();
+        }
+      });
+
+      // Touch events
+      button.addEventListener('touchstart', (e) => {
+        e.preventDefault();
+        if (action === 'SPEED+' || action === 'SPEED-') return;
+        if (action === 'FWD' || action === 'BWD' || action === 'LEFT' || action === 'RIGHT') {
+          startMotorCommand(action);
+        } else {
+          sendCommand(action);
+        }
+      });
+
+      button.addEventListener('touchend', (e) => {
+        e.preventDefault();
+        if (action === 'SPEED+') {
+          currentSpeed = Math.min(currentSpeed + 85, 255);
+          updateSpeedDisplay();
+          sendCommand(action);
+        } else if (action === 'SPEED-') {
+          currentSpeed = Math.max(currentSpeed - 85, 85);
+          updateSpeedDisplay();
+          sendCommand(action);
+        } else if (action === 'FWD' || action === 'BWD' || action === 'LEFT' || action === 'RIGHT') {
+          stopMotorCommand();
+        } else if (action === 'STOP') {
+          stopMotorCommand();
+        }
+      });
+    });
+  </script>
+</body>
+</html>
+)rawliteral";
+
+static esp_err_t index_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t stream_handler(httpd_req_t *req) {
+  camera_fb_t *fb = NULL;
+  struct timeval _timestamp;
+  esp_err_t res = ESP_OK;
+  size_t _jpg_buf_len = 0;
+  uint8_t *_jpg_buf = NULL;
+  char *part_buf[128];
+
+  // Mark client as connected for power saving
+  clientConnected = true;
+  lastClientActivity = millis();
+  #if DEBUG_ENABLED
+    Serial.println("Stream client connected");
+  #endif
+
+  static int64_t last_frame = 0;
+  if (!last_frame) {
+    last_frame = esp_timer_get_time();
+  }
+
+  res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) {
+    clientConnected = false;
+    return res;
+  }
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "X-Framerate", "60");
+
+  while (true) {
+    lastClientActivity = millis();  // Update activity timestamp
+    
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      #if DEBUG_ENABLED
+        Serial.println("Camera capture failed");
+      #endif
+      res = ESP_FAIL;
+    } else {
+      _timestamp.tv_sec = fb->timestamp.tv_sec;
+      _timestamp.tv_usec = fb->timestamp.tv_usec;
+      if (fb->format != PIXFORMAT_JPEG) {
+        bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
+        esp_camera_fb_return(fb);
+        fb = NULL;
+        if (!jpeg_converted) {
+          #if DEBUG_ENABLED
+            Serial.println("JPEG compression failed");
+          #endif
+          res = ESP_FAIL;
+        }
+      } else {
+        _jpg_buf_len = fb->len;
+        _jpg_buf = fb->buf;
+      }
+    }
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+    }
+    if (res == ESP_OK) {
+      size_t hlen = snprintf((char *)part_buf, 128, _STREAM_PART, _jpg_buf_len, _timestamp.tv_sec, _timestamp.tv_usec);
+      res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+    }
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+    }
+    if (fb) {
+      esp_camera_fb_return(fb);
+      fb = NULL;
+      _jpg_buf = NULL;
+    } else if (_jpg_buf) {
+      free(_jpg_buf);
+      _jpg_buf = NULL;
+    }
+    if (res != ESP_OK) {
+      #if DEBUG_ENABLED
+        Serial.println("Send frame failed");
+      #endif
+      break;
+    }
+    int64_t fr_end = esp_timer_get_time();
+
+    int64_t frame_time = fr_end - last_frame;
+    last_frame = fr_end;
+    frame_time /= 1000;
+    
+    // Log every 100 frames
+    #if DEBUG_ENABLED
+      static int frame_count = 0;
+      frame_count++;
+      if (frame_count % 100 == 0) {
+        Serial.printf("MJPG: %uB %ums (%.1ffps)\n", 
+                      (uint32_t)(_jpg_buf_len), 
+                      (uint32_t)frame_time, 
+                      1000.0 / (uint32_t)frame_time);
+      }
+    #endif
+  }
+
+  // Client disconnected
+  clientConnected = false;
+  #if DEBUG_ENABLED
+    Serial.println("Stream client disconnected");
+  #endif
+  return res;
+}
+
+static esp_err_t action_handler(httpd_req_t *req) {
+  char query[128];
+  int len = httpd_req_get_url_query_len(req) + 1;
+  
+  // Track client activity for power saving
+  lastClientActivity = millis();
+  
+  if (len > sizeof(query)) {
+    httpd_resp_send_404(req);
+    return ESP_OK;
+  }
+
+  if (httpd_req_get_url_query_str(req, query, len) == ESP_OK) {
+    char action[32] = {0};
+    if (httpd_query_key_value(query, "cmd", action, sizeof(action)) == ESP_OK) {
+      processCommand(action);
+    } else if (httpd_query_key_value(query, "framesize", action, sizeof(action)) == ESP_OK) {
+      // Handle resolution change
+      int framesize = atoi(action);
+      sensor_t *s = esp_camera_sensor_get();
+      if (s) {
+        // Framesize enum: 0-13 are valid values
+        // FRAMESIZE_96X96,     // 0
+        // FRAMESIZE_QQVGA,     // 1 (160x120)
+        // FRAMESIZE_QCIF,      // 2 (176x144)
+        // FRAMESIZE_HQVGA,     // 3 (240x176)
+        // FRAMESIZE_240X240,   // 4
+        // FRAMESIZE_QVGA,      // 5 (320x240)
+        // FRAMESIZE_CIF,       // 6 (400x296)
+        // FRAMESIZE_HVGA,      // 7 (480x320)
+        // FRAMESIZE_VGA,       // 8 (640x480)
+        // FRAMESIZE_SVGA,      // 9 (800x600)
+        // FRAMESIZE_XGA,       // 10 (1024x768)
+        // FRAMESIZE_HD,        // 11 (1280x720)
+        // FRAMESIZE_SXGA,      // 12 (1280x1024)
+        // FRAMESIZE_UXGA       // 13 (1600x1200)
+        
+        if (framesize >= 0 && framesize <= 13) {
+          s->set_framesize(s, (framesize_t)framesize);
+          #if DEBUG_ENABLED
+            Serial.printf("Resolution changed to framesize: %d\n", framesize);
+          #endif
+        } else {
+          #if DEBUG_ENABLED
+            Serial.printf("Invalid framesize: %d\n", framesize);
+          #endif
+        }
+      }
+    }
+  }
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+  return ESP_OK;
+}
+
+static esp_err_t snapshot_handler(httpd_req_t *req) {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=snapshot.jpg");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  
+  esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+  return res;
+}
+
+static esp_err_t wifi_status_handler(httpd_req_t *req) {
+  char response[64];
+  snprintf(response, sizeof(response), "{\"rssi\":%d}", WiFi.RSSI());
+  
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, response, strlen(response));
+}
+
+void startCameraServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = HTTP_PORT;
+  config.max_open_sockets = 3;
+  config.stack_size = 8192;  // Increased from 4096 for high-res streaming
+
+  httpd_uri_t index_uri = {
+    .uri = "/",
+    .method = HTTP_GET,
+    .handler = index_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t cmd_uri = {
+    .uri = "/action",
+    .method = HTTP_GET,
+    .handler = action_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t snapshot_uri = {
+    .uri = "/snapshot",
+    .method = HTTP_GET,
+    .handler = snapshot_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t wifi_status_uri = {
+    .uri = "/wifi-status",
+    .method = HTTP_GET,
+    .handler = wifi_status_handler,
+    .user_ctx = NULL
+  };
+
+  if (httpd_start(&camera_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(camera_httpd, &index_uri);
+    httpd_register_uri_handler(camera_httpd, &cmd_uri);
+    httpd_register_uri_handler(camera_httpd, &snapshot_uri);
+    httpd_register_uri_handler(camera_httpd, &wifi_status_uri);
+  }
+
+  config.server_port = STREAM_PORT;
+  config.ctrl_port = 32769;
+  
+  httpd_uri_t stream_uri = {
+    .uri = "/stream",
+    .method = HTTP_GET,
+    .handler = stream_handler,
+    .user_ctx = NULL
+  };
+
+  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &stream_uri);
+  }
+}

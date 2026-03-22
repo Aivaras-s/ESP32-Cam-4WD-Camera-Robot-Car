@@ -1,0 +1,1103 @@
+/*
+  ESP32-CAM Robot - AsyncWebServer with WebSocket
+  Features: Motor control, UDP, WebSocket, MJPEG streaming
+*/
+
+#include <Arduino.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include "esp_timer.h"
+#include "img_converters.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// Debug control
+#define DEBUG_ENABLED 1
+
+// WiFi credentials
+const char *ssid = "Susitiko zirnis pupa";
+const char *password = "Pizdukas1";
+
+// Camera pins (AI-Thinker ESP32-CAM)
+#define PWDN_GPIO_NUM 32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 0
+#define SIOD_GPIO_NUM 26
+#define SIOC_GPIO_NUM 27
+#define Y9_GPIO_NUM 35
+#define Y8_GPIO_NUM 34
+#define Y7_GPIO_NUM 39
+#define Y6_GPIO_NUM 36
+#define Y5_GPIO_NUM 21
+#define Y4_GPIO_NUM 19
+#define Y3_GPIO_NUM 18
+#define Y2_GPIO_NUM 5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM 23
+#define PCLK_GPIO_NUM 22
+
+// Motor pins
+#define MOTOR_R_PIN_1 14
+#define MOTOR_R_PIN_2 15
+#define MOTOR_L_PIN_1 13
+#define MOTOR_L_PIN_2 12
+#define LED_GPIO_NUM 4
+
+// Motor speed
+int motorSpeed = 170;
+
+// Ports
+#define HTTP_PORT 80
+#define UDP_CONTROL_PORT 8888
+#define UDP_VIDEO_PORT 8889
+
+// Power saving
+volatile bool clientConnected = false;
+volatile unsigned long lastClientActivity = 0;
+#define IDLE_TIMEOUT_MS 30000
+
+// Motor watchdog
+volatile unsigned long lastMotorCommand = 0;
+#define MOTOR_WATCHDOG_TIMEOUT_MS 1000
+volatile bool motorsActive = false;
+String currentCommand = "STOP";  // Track current movement command
+
+// Servers
+AsyncWebServer server(HTTP_PORT);
+AsyncWebSocket ws("/ws");
+WiFiUDP udpServer;
+WiFiUDP udpVideo;
+
+// UDP Video streaming
+IPAddress videoClientIP;
+uint16_t videoClientPort = 0;
+bool videoStreamActive = false;
+unsigned long lastFrameTime = 0;
+#define FRAME_INTERVAL_MS 50  // 20 FPS
+#define UDP_PACKET_SIZE 1400  // Safe MTU size
+
+// Streaming
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+// Forward declarations
+void processCommand(const char* cmd);
+void applyMotorCommand(const char* cmd);
+
+// Apply motor command with current speed
+void applyMotorCommand(const char* cmd) {
+  if (strcmp(cmd, "FWD") == 0) {
+    lastMotorCommand = millis();
+    motorsActive = true;
+    // Both motors forward at full speed
+    analogWrite(MOTOR_R_PIN_1, 0);
+    analogWrite(MOTOR_R_PIN_2, motorSpeed);
+    analogWrite(MOTOR_L_PIN_1, motorSpeed);
+    analogWrite(MOTOR_L_PIN_2, 0);
+  }
+  else if (strcmp(cmd, "BWD") == 0) {
+    lastMotorCommand = millis();
+    motorsActive = true;
+    // Both motors backward at full speed
+    analogWrite(MOTOR_R_PIN_1, motorSpeed);
+    analogWrite(MOTOR_R_PIN_2, 0);
+    analogWrite(MOTOR_L_PIN_1, 0);
+    analogWrite(MOTOR_L_PIN_2, motorSpeed);
+  }
+  else if (strcmp(cmd, "LEFT") == 0) {
+    lastMotorCommand = millis();
+    motorsActive = true;
+    // Tank turn left: right forward, left backward
+    analogWrite(MOTOR_R_PIN_1, 0);
+    analogWrite(MOTOR_R_PIN_2, motorSpeed);
+    analogWrite(MOTOR_L_PIN_1, 0);
+    analogWrite(MOTOR_L_PIN_2, motorSpeed);
+  }
+  else if (strcmp(cmd, "RIGHT") == 0) {
+    lastMotorCommand = millis();
+    motorsActive = true;
+    // Tank turn right: left forward, right backward
+    analogWrite(MOTOR_R_PIN_1, motorSpeed);
+    analogWrite(MOTOR_R_PIN_2, 0);
+    analogWrite(MOTOR_L_PIN_1, motorSpeed);
+    analogWrite(MOTOR_L_PIN_2, 0);
+  }
+  // Combined movement commands (gentle arc turns)
+  else if (strcmp(cmd, "FWD+RIGHT") == 0) {
+    lastMotorCommand = millis();
+    motorsActive = true;
+    // Forward right: Both forward, but RIGHT motor slower (gentle right arc)
+    analogWrite(MOTOR_R_PIN_1, 0);
+    analogWrite(MOTOR_R_PIN_2, (motorSpeed * 3) / 4);  // Right slower
+    analogWrite(MOTOR_L_PIN_1, motorSpeed);             // Left full speed
+    analogWrite(MOTOR_L_PIN_2, 0);
+  }
+  else if (strcmp(cmd, "FWD+LEFT") == 0) {
+    lastMotorCommand = millis();
+    motorsActive = true;
+    // Forward left: Both forward, but LEFT motor slower (gentle left arc)
+    analogWrite(MOTOR_R_PIN_1, 0);
+    analogWrite(MOTOR_R_PIN_2, motorSpeed);             // Right full speed
+    analogWrite(MOTOR_L_PIN_1, (motorSpeed * 3) / 4);  // Left slower
+    analogWrite(MOTOR_L_PIN_2, 0);
+  }
+  else if (strcmp(cmd, "BWD+RIGHT") == 0) {
+    lastMotorCommand = millis();
+    motorsActive = true;
+    // Backward right: Both backward, but RIGHT motor slower
+    analogWrite(MOTOR_R_PIN_1, (motorSpeed * 3) / 4);  // Right slower
+    analogWrite(MOTOR_R_PIN_2, 0);
+    analogWrite(MOTOR_L_PIN_1, 0);
+    analogWrite(MOTOR_L_PIN_2, motorSpeed);             // Left full speed
+  }
+  else if (strcmp(cmd, "BWD+LEFT") == 0) {
+    lastMotorCommand = millis();
+    motorsActive = true;
+    // Backward left: Both backward, but LEFT motor slower
+    analogWrite(MOTOR_R_PIN_1, motorSpeed);             // Right full speed
+    analogWrite(MOTOR_R_PIN_2, 0);
+    analogWrite(MOTOR_L_PIN_1, 0);
+    analogWrite(MOTOR_L_PIN_2, (motorSpeed * 3) / 4);  // Left slower
+  }
+  else if (strcmp(cmd, "STOP") == 0) {
+    motorsActive = false;
+    analogWrite(MOTOR_R_PIN_1, 0);
+    analogWrite(MOTOR_R_PIN_2, 0);
+    analogWrite(MOTOR_L_PIN_1, 0);
+    analogWrite(MOTOR_L_PIN_2, 0);
+  }
+}
+
+// Process control commands
+void processCommand(const char* cmd) {
+  // Check if this is a movement command
+  if (strcmp(cmd, "FWD") == 0 || strcmp(cmd, "BWD") == 0 || 
+      strcmp(cmd, "LEFT") == 0 || strcmp(cmd, "RIGHT") == 0 ||
+      strcmp(cmd, "FWD+RIGHT") == 0 || strcmp(cmd, "FWD+LEFT") == 0 ||
+      strcmp(cmd, "BWD+RIGHT") == 0 || strcmp(cmd, "BWD+LEFT") == 0 ||
+      strcmp(cmd, "STOP") == 0) {
+    currentCommand = cmd;
+    applyMotorCommand(cmd);
+  }
+  else if (strcmp(cmd, "LED_ON") == 0) {
+    digitalWrite(LED_GPIO_NUM, HIGH);
+  }
+  else if (strcmp(cmd, "LED_OFF") == 0) {
+    digitalWrite(LED_GPIO_NUM, LOW);
+  }
+  else if (strcmp(cmd, "SPEED+") == 0) {
+    motorSpeed = constrain(motorSpeed + 85, 85, 255);
+    // Reapply current motor command with new speed
+    if (motorsActive) {
+      applyMotorCommand(currentCommand.c_str());
+    }
+  }
+  else if (strcmp(cmd, "SPEED-") == 0) {
+    motorSpeed = constrain(motorSpeed - 85, 85, 255);
+    // Reapply current motor command with new speed
+    if (motorsActive) {
+      applyMotorCommand(currentCommand.c_str());
+    }
+  }
+  else if (strcmp(cmd, "VIDEO_START") == 0) {
+    videoStreamActive = true;
+    #if DEBUG_ENABLED
+      Serial.printf("[VIDEO] Stream started to %s:%d\n", videoClientIP.toString().c_str(), videoClientPort);
+    #endif
+  }
+  else if (strcmp(cmd, "VIDEO_STOP") == 0) {
+    videoStreamActive = false;
+    #if DEBUG_ENABLED
+      Serial.println("[VIDEO] Stream stopped");
+    #endif
+  }
+  else if (strncmp(cmd, "JOY:", 4) == 0) {
+    // Joystick command format: JOY:X,Y (X and Y from -100 to 100)
+    int x = 0, y = 0;
+    if (sscanf(cmd + 4, "%d,%d", &x, &y) == 2) {
+      x = constrain(x, -100, 100);
+      y = constrain(y, -100, 100);
+      
+      #if DEBUG_ENABLED
+        Serial.printf("[JOY] X:%d Y:%d\n", x, y);
+      #endif
+      
+      // Calculate motor speeds based on joystick position
+      // Y axis: forward/backward (-100 to 100)
+      // X axis: left/right steering (-100 to 100)
+      
+      if (abs(x) < 10 && abs(y) < 10) {
+        // Deadzone - stop motors
+        motorsActive = false;
+        analogWrite(MOTOR_R_PIN_1, 0);
+        analogWrite(MOTOR_R_PIN_2, 0);
+        analogWrite(MOTOR_L_PIN_1, 0);
+        analogWrite(MOTOR_L_PIN_2, 0);
+      } else {
+        lastMotorCommand = millis();
+        motorsActive = true;
+        
+        // Calculate base speed from Y axis (forward/backward)
+        int baseSpeed = map(abs(y), 0, 100, 0, motorSpeed);
+        
+        // Calculate differential steering from X axis
+        // Positive X = turn right (reduce right motor)
+        // Negative X = turn left (reduce left motor)
+        int leftSpeed = baseSpeed;
+        int rightSpeed = baseSpeed;
+        
+        if (x > 0) {
+          // Turn right - reduce right motor
+          rightSpeed = baseSpeed * (100 - abs(x)) / 100;
+        } else if (x < 0) {
+          // Turn left - reduce left motor
+          leftSpeed = baseSpeed * (100 - abs(x)) / 100;
+        }
+        
+        // Apply direction and speed
+        if (y > 0) {
+          // Forward
+          analogWrite(MOTOR_R_PIN_1, 0);
+          analogWrite(MOTOR_R_PIN_2, rightSpeed);
+          analogWrite(MOTOR_L_PIN_1, leftSpeed);
+          analogWrite(MOTOR_L_PIN_2, 0);
+        } else {
+          // Backward
+          analogWrite(MOTOR_R_PIN_1, rightSpeed);
+          analogWrite(MOTOR_R_PIN_2, 0);
+          analogWrite(MOTOR_L_PIN_1, 0);
+          analogWrite(MOTOR_L_PIN_2, leftSpeed);
+        }
+      }
+    }
+  }
+  else if (strcmp(cmd, "REBOOT") == 0) {
+    #if DEBUG_ENABLED
+      Serial.println("Rebooting...");
+    #endif
+    delay(100);
+    ESP.restart();
+  }
+}
+
+// WebSocket event handler
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, 
+               void *arg, uint8_t *data, size_t len) {
+  if (type == WS_EVT_CONNECT) {
+    #if DEBUG_ENABLED
+      Serial.printf("[WS] Client #%u connected\n", client->id());
+    #endif
+    clientConnected = true;
+    lastClientActivity = millis();
+    client->text("Connected");
+  } 
+  else if (type == WS_EVT_DISCONNECT) {
+    #if DEBUG_ENABLED
+      Serial.printf("[WS] Client #%u disconnected\n", client->id());
+    #endif
+    // Check if any clients still connected
+    clientConnected = (ws.count() > 0);
+  } 
+  else if (type == WS_EVT_DATA) {
+    AwsFrameInfo *info = (AwsFrameInfo*)arg;
+    if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+      data[len] = 0;
+      char command[32];
+      strncpy(command, (char*)data, sizeof(command) - 1);
+      command[sizeof(command) - 1] = '\0';
+      
+      #if DEBUG_ENABLED
+        Serial.printf("[WS] Command: %s\n", command);
+      #endif
+      
+      processCommand(command);
+      lastClientActivity = millis();
+      client->text("OK");
+    }
+  }
+}
+
+// MJPEG Stream handler (chunked, non-blocking)
+class AsyncMjpegResponse: public AsyncAbstractResponse {
+  private:
+    camera_fb_t * fb;
+    size_t _index;
+    bool headerSent;
+    
+  public:
+    AsyncMjpegResponse() {
+      _code = 200;
+      _contentType = "multipart/x-mixed-replace; boundary=frame";
+      _contentLength = 0;
+      _sendContentLength = false;
+      fb = NULL;
+      _index = 0;
+      headerSent = false;
+      addHeader("Access-Control-Allow-Origin", "*");
+    }
+    
+    ~AsyncMjpegResponse() {
+      if (fb) {
+        esp_camera_fb_return(fb);
+        fb = NULL;
+      }
+    }
+    
+    bool _sourceValid() const { return true; }
+    
+    size_t _fillBuffer(uint8_t *buf, size_t maxLen) {
+      size_t len = 0;
+      
+      // If we don't have a frame, get one
+      if (!fb) {
+        fb = esp_camera_fb_get();
+        if (!fb) {
+          // No frame available, yield and try again
+          yield();
+          delay(10);
+          return 0;
+        }
+        _index = 0;
+        headerSent = false;
+      }
+      
+      // Send frame header
+      if (!headerSent) {
+        String header = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + String(fb->len) + "\r\n\r\n";
+        size_t headerLen = header.length();
+        if (headerLen <= maxLen) {
+          memcpy(buf, header.c_str(), headerLen);
+          len = headerLen;
+          headerSent = true;
+        }
+        return len;
+      }
+      
+      // Send frame data in chunks
+      if (_index < fb->len) {
+        size_t chunkSize = min(maxLen - len, fb->len - _index);
+        memcpy(buf + len, fb->buf + _index, chunkSize);
+        _index += chunkSize;
+        len += chunkSize;
+        
+        // If frame complete, add closing CRLF
+        if (_index >= fb->len) {
+          if (len + 2 <= maxLen) {
+            buf[len++] = '\r';
+            buf[len++] = '\n';
+            // Return the frame buffer immediately for next frame
+            esp_camera_fb_return(fb);
+            fb = NULL;
+          }
+        }
+      }
+      
+      // Small delay to prevent watchdog timeout and allow other tasks
+      if (len > 0) {
+        delay(1);
+        yield();
+      }
+      
+      return len;
+    }
+};
+
+void handleStream(AsyncWebServerRequest *request) {
+  #if DEBUG_ENABLED
+    Serial.println("[STREAM] Client connected");
+  #endif
+  
+  AsyncMjpegResponse *response = new AsyncMjpegResponse();
+  request->send(response);
+}
+
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  // Initialize motor pins
+  pinMode(MOTOR_R_PIN_1, OUTPUT);
+  pinMode(MOTOR_R_PIN_2, OUTPUT);
+  pinMode(MOTOR_L_PIN_1, OUTPUT);
+  pinMode(MOTOR_L_PIN_2, OUTPUT);
+  pinMode(LED_GPIO_NUM, OUTPUT);
+
+  #if DEBUG_ENABLED
+    Serial.begin(115200);
+    Serial.println("\nESP32-CAM Robot Starting...");
+  #endif
+
+  // Camera configuration
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.frame_size = FRAMESIZE_UXGA;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+
+  if (psramFound()) {
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+    config.grab_mode = CAMERA_GRAB_LATEST;
+  } else {
+    config.frame_size = FRAMESIZE_SVGA;
+    config.fb_location = CAMERA_FB_IN_DRAM;
+  }
+
+  // Camera init
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    #if DEBUG_ENABLED
+      Serial.printf("Camera init failed: 0x%x\n", err);
+    #endif
+    return;
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  s->set_framesize(s, FRAMESIZE_QVGA);
+  s->set_vflip(s, 1);
+
+  // WiFi
+  WiFi.begin(ssid, password);
+  WiFi.setSleep(false);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    #if DEBUG_ENABLED
+      Serial.print(".");
+    #endif
+  }
+  
+  #if DEBUG_ENABLED
+    Serial.println("\nWiFi connected");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  #endif
+
+  // WebSocket
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+
+  // Routes
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    const char* html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ESP32-CAM Robot</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta charset="UTF-8">
+  <style>
+    * {
+      -webkit-tap-highlight-color: transparent;
+      -webkit-touch-callout: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      margin: 0;
+      padding: 10px;
+      background: #1a1a1a;
+      color: #fff;
+      touch-action: manipulation;
+    }
+    h1 {
+      font-size: 24px;
+      margin: 10px 0;
+      color: #4a9eff;
+    }
+    .badge {
+      display: inline-block;
+      color: white;
+      padding: 5px 10px;
+      border-radius: 5px;
+      font-size: 12px;
+      margin: 5px;
+    }
+    .badge.http { background: #3498db; }
+    .badge.udp { background: #9b59b6; }
+    .badge.ws { background: #27ae60; }
+    .badge.disconnected { background: #e74c3c; }
+    #photo {
+      width: 100%;
+      max-width: 640px;
+      height: auto;
+      border: 2px solid #2f4468;
+      border-radius: 8px;
+      margin: 10px auto;
+      display: block;
+      background: #000;
+    }
+    .control-container {
+      max-width: 640px;
+      margin: 20px auto;
+      padding: 10px;
+    }
+    .joystick-container {
+      position: relative;
+      width: 250px;
+      height: 250px;
+      margin: 20px auto;
+      background: radial-gradient(circle, #1e2d47, #0d1621);
+      border-radius: 50%;
+      border: 3px solid #2f4468;
+      box-shadow: 0 8px 16px rgba(0,0,0,0.5), inset 0 0 20px rgba(0,0,0,0.3);
+      touch-action: none;
+    }
+    .joystick-base {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+    }
+    .joystick-handle {
+      position: absolute;
+      width: 80px;
+      height: 80px;
+      background: radial-gradient(circle at 30% 30%, #4a9eff, #2f4468);
+      border: 3px solid #4a9eff;
+      border-radius: 50%;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      cursor: grab;
+      box-shadow: 0 4px 12px rgba(74, 158, 255, 0.4);
+      transition: box-shadow 0.1s;
+    }
+    .joystick-handle:active {
+      cursor: grabbing;
+      box-shadow: 0 0 20px rgba(74, 158, 255, 0.8);
+    }
+    .joystick-crosshair {
+      position: absolute;
+      width: 2px;
+      height: 100%;
+      background: rgba(74, 158, 255, 0.3);
+      left: 50%;
+      transform: translateX(-50%);
+    }
+    .joystick-crosshair.h {
+      width: 100%;
+      height: 2px;
+      top: 50%;
+      transform: translateY(-50%);
+      left: 0;
+    }
+    .joystick-info {
+      text-align: center;
+      margin-top: 15px;
+      font-size: 14px;
+      color: #4a9eff;
+      font-family: monospace;
+    }
+    .button-row {
+      display: flex;
+      justify-content: center;
+      gap: 10px;
+      margin: 15px 0;
+      flex-wrap: wrap;
+    }
+    .button, .led-button, .reboot-button {
+      border: none;
+      text-align: center;
+      font-size: 16px;
+      cursor: pointer;
+      padding: 12px 24px;
+      border-radius: 8px;
+      touch-action: manipulation;
+      transition: all 0.1s ease;
+      font-weight: bold;
+      box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+    }
+    .button {
+      background: linear-gradient(145deg, #2f4468, #1e2d47);
+      color: white;
+    }
+    .button:active {
+      transform: scale(0.95);
+    }
+    .led-button {
+      background: linear-gradient(145deg, #555, #444);
+      color: white;
+    }
+    .led-on {
+      background: linear-gradient(145deg, #ffd700, #f0c40f);
+      color: #000;
+    }
+    .reboot-button { 
+      background: linear-gradient(145deg, #e74c3c, #c0392b);
+      color: white;
+    }
+    .info {
+      margin: 10px;
+      font-size: 14px;
+      color: #4a9eff;
+    }
+  </style>
+</head>
+<body>
+  <h1>ESP32-CAM Robot Control</h1>
+  <div>
+    <span class="badge http">HTTP: Port 80</span>
+    <span class="badge udp">UDP: Port 8888</span>
+    <span class="badge ws" id="wsBadge">WebSocket: Connecting...</span>
+  </div>
+  
+  <img src="/stream" id="photo" alt="Camera Stream">
+  
+  <div class="control-container">
+    <div class="info">
+      <label for="resolution">Resolution: </label>
+      <select id="resolution">
+        <option value="5" selected>QVGA (320x240)</option>
+        <option value="6">CIF (400x296)</option>
+        <option value="8">VGA (640x480)</option>
+        <option value="9">SVGA (800x600)</option>
+        <option value="10">XGA (1024x768)</option>
+        <option value="11">HD (1280x720)</option>
+        <option value="12">SXGA (1280x1024)</option>
+      <option value="13">UXGA (1600x1200)</option>
+    </select>
+    | Speed: <span id="speedText">Medium</span>
+    </div>
+
+    <div class="joystick-container" id="joystickContainer">
+      <div class="joystick-base">
+        <div class="joystick-crosshair"></div>
+        <div class="joystick-crosshair h"></div>
+      </div>
+      <div class="joystick-handle" id="joystickHandle"></div>
+    </div>
+    
+    <div class="joystick-info">
+      X: <span id="joyX">0</span> | Y: <span id="joyY">0</span>
+    </div>
+
+    <div class="button-row">
+      <button class="button" data-action="SPEED-">Speed −</button>
+      <button id="ledButton" class="led-button">LED OFF</button>
+      <button class="button" data-action="SPEED+">Speed +</button>
+    </div>
+    
+    <div class="button-row">
+      <button id="rebootButton" class="reboot-button">REBOOT ESP32</button>
+    </div>
+  </div>
+
+  <script>
+    const wsBadge = document.getElementById('wsBadge');
+    let websocket = null;
+    let useWebSocket = false;
+    
+    function connectWebSocket() {
+      const wsUrl = 'ws://' + window.location.hostname + '/ws';
+      websocket = new WebSocket(wsUrl);
+      
+      websocket.onopen = function() {
+        console.log('[WS] Connected');
+        wsBadge.textContent = 'WebSocket: Connected ✓';
+        wsBadge.className = 'badge ws';
+        useWebSocket = true;
+      };
+      
+      websocket.onclose = function() {
+        console.log('[WS] Disconnected');
+        wsBadge.textContent = 'WebSocket: Disconnected';
+        wsBadge.className = 'badge disconnected';
+        useWebSocket = false;
+        setTimeout(connectWebSocket, 3000);
+      };
+      
+      websocket.onerror = function(error) {
+        console.log('[WS] Error:', error);
+      };
+      
+      websocket.onmessage = function(event) {
+        console.log('[WS] RX:', event.data);
+      };
+    }
+    
+    connectWebSocket();
+
+    // Resolution selector
+    const resolutionSelect = document.getElementById('resolution');
+    resolutionSelect.addEventListener('change', function() {
+      fetch('/action?framesize=' + this.value)
+        .then(() => {
+          // Reload stream after resolution change
+          const imgElement = document.getElementById('photo');
+          setTimeout(() => {
+            imgElement.src = '/stream?' + Date.now();
+          }, 300);
+        });
+    });
+
+    function sendCommand(cmd) {
+      if (useWebSocket && websocket && websocket.readyState === WebSocket.OPEN) {
+        websocket.send(cmd);
+      } else {
+        fetch('/action?cmd=' + cmd);
+      }
+    }
+
+    let currentSpeed = 170;
+    const speedLevels = { 85: 'Low', 170: 'Medium', 255: 'High' };
+
+    function updateSpeedDisplay() {
+      document.getElementById('speedText').textContent = speedLevels[currentSpeed] || 'Medium';
+    }
+
+    // Joystick control
+    const joystickContainer = document.getElementById('joystickContainer');
+    const joystickHandle = document.getElementById('joystickHandle');
+    const joyXDisplay = document.getElementById('joyX');
+    const joyYDisplay = document.getElementById('joyY');
+    
+    let isDragging = false;
+    let joystickX = 0;
+    let joystickY = 0;
+    let joystickInterval = null;
+    const maxDistance = 85; // Max pixels from center
+    
+    function updateJoystick(clientX, clientY) {
+      const rect = joystickContainer.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+      
+      let deltaX = clientX - centerX;
+      let deltaY = centerY - clientY; // Inverted for Y axis
+      
+      const distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
+      
+      if (distance > maxDistance) {
+        const angle = Math.atan2(deltaY, deltaX);
+        deltaX = Math.cos(angle) * maxDistance;
+        deltaY = Math.sin(angle) * maxDistance;
+      }
+      
+      joystickHandle.style.transform = `translate(calc(-50% + ${deltaX}px), calc(-50% + ${-deltaY}px))`;
+      
+      joystickX = Math.round((deltaX / maxDistance) * 100);
+      joystickY = Math.round((deltaY / maxDistance) * 100);
+      
+      joyXDisplay.textContent = joystickX;
+      joyYDisplay.textContent = joystickY;
+    }
+    
+    function resetJoystick() {
+      joystickHandle.style.transform = 'translate(-50%, -50%)';
+      joystickX = 0;
+      joystickY = 0;
+      joyXDisplay.textContent = '0';
+      joyYDisplay.textContent = '0';
+      sendCommand('JOY:0,0');
+    }
+    
+    function startJoystickUpdates() {
+      if (joystickInterval) clearInterval(joystickInterval);
+      joystickInterval = setInterval(() => {
+        if (isDragging) {
+          sendCommand(`JOY:${joystickX},${joystickY}`);
+        }
+      }, 100);
+    }
+    
+    joystickHandle.addEventListener('mousedown', (e) => {
+      isDragging = true;
+      startJoystickUpdates();
+      e.preventDefault();
+    });
+    
+    joystickHandle.addEventListener('touchstart', (e) => {
+      isDragging = true;
+      startJoystickUpdates();
+      e.preventDefault();
+    }, { passive: false });
+    
+    document.addEventListener('mousemove', (e) => {
+      if (isDragging) {
+        updateJoystick(e.clientX, e.clientY);
+      }
+    });
+    
+    document.addEventListener('touchmove', (e) => {
+      if (isDragging && e.touches.length > 0) {
+        updateJoystick(e.touches[0].clientX, e.touches[0].clientY);
+      }
+    }, { passive: false });
+    
+    document.addEventListener('mouseup', () => {
+      if (isDragging) {
+        isDragging = false;
+        resetJoystick();
+        if (joystickInterval) {
+          clearInterval(joystickInterval);
+          joystickInterval = null;
+        }
+      }
+    });
+    
+    document.addEventListener('touchend', () => {
+      if (isDragging) {
+        isDragging = false;
+        resetJoystick();
+        if (joystickInterval) {
+          clearInterval(joystickInterval);
+          joystickInterval = null;
+        }
+      }
+    });
+
+    // LED button
+    let ledState = false;
+    const ledButton = document.getElementById('ledButton');
+    ledButton.addEventListener('click', (e) => {
+      e.preventDefault();
+      ledState = !ledState;
+      ledButton.classList.toggle('led-on', ledState);
+      ledButton.textContent = ledState ? 'LED ON' : 'LED OFF';
+      sendCommand(ledState ? 'LED_ON' : 'LED_OFF');
+    });
+
+    // Reboot button
+    const rebootButton = document.getElementById('rebootButton');
+    rebootButton.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (confirm('Reboot ESP32-CAM?')) {
+        sendCommand('REBOOT');
+      }
+    });
+
+    // Speed buttons
+    const buttons = document.querySelectorAll('.button[data-action]');
+    buttons.forEach(button => {
+      const action = button.getAttribute('data-action');
+      
+      button.addEventListener('click', (e) => {
+        e.preventDefault();
+        if (action === 'SPEED+') {
+          currentSpeed = Math.min(currentSpeed + 85, 255);
+          updateSpeedDisplay();
+          sendCommand(action);
+        } else if (action === 'SPEED-') {
+          currentSpeed = Math.max(currentSpeed - 85, 85);
+          updateSpeedDisplay();
+          sendCommand(action);
+        }
+      });
+    });
+  </script>
+</body>
+</html>
+)rawliteral";
+    request->send(200, "text/html", html);
+  });
+
+  // Action endpoint (HTTP fallback)
+  server.on("/action", HTTP_GET, [](AsyncWebServerRequest *request){
+    lastClientActivity = millis();
+    if (request->hasParam("cmd")) {
+      String cmd = request->getParam("cmd")->value();
+      processCommand(cmd.c_str());
+    }
+    else if (request->hasParam("framesize")) {
+      int framesize = request->getParam("framesize")->value().toInt();
+      sensor_t *s = esp_camera_sensor_get();
+      if (s) {
+        s->set_framesize(s, (framesize_t)framesize);
+        #if DEBUG_ENABLED
+          Serial.printf("[CAMERA] Resolution changed to: %d\n", framesize);
+        #endif
+      }
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  // Snapshot endpoint (for JavaScript to poll)
+  // MJPEG stream endpoint
+  server.on("/stream", HTTP_GET, handleStream);
+
+  // WiFi status
+  server.on("/wifi-status", HTTP_GET, [](AsyncWebServerRequest *request){
+    char response[64];
+    snprintf(response, sizeof(response), "{\"rssi\":%d}", WiFi.RSSI());
+    request->send(200, "application/json", response);
+  });
+
+  // Start server
+  server.begin();
+
+  // Start UDP
+  udpServer.begin(UDP_CONTROL_PORT);
+  udpVideo.begin(UDP_VIDEO_PORT);
+
+  #if DEBUG_ENABLED
+    Serial.printf("HTTP Server: http://%s/\n", WiFi.localIP().toString().c_str());
+    Serial.printf("WebSocket: ws://%s/ws\n", WiFi.localIP().toString().c_str());
+    Serial.printf("UDP Control Port: %d\n", UDP_CONTROL_PORT);
+    Serial.printf("UDP Video Port: %d\n", UDP_VIDEO_PORT);
+  #endif
+}
+
+void loop() {
+  // Cleanup WebSocket
+  ws.cleanupClients();
+  
+  // Handle UDP control
+  int packetSize = udpServer.parsePacket();
+  if (packetSize) {
+    char incomingPacket[32];
+    int len = udpServer.read(incomingPacket, sizeof(incomingPacket) - 1);
+    if (len > 0) {
+      incomingPacket[len] = '\0';
+      
+      #if DEBUG_ENABLED
+        Serial.printf("[UDP] RX: %s\n", incomingPacket);
+      #endif
+      
+      processCommand(incomingPacket);
+      
+      udpServer.beginPacket(udpServer.remoteIP(), udpServer.remotePort());
+      udpServer.write((const uint8_t*)"OK", 2);
+      udpServer.endPacket();
+      
+      lastClientActivity = millis();
+    }
+    
+    // Yield to allow async tasks (like streaming) to run
+    yield();
+  }
+  
+  // Handle UDP video requests
+  int videoPacketSize = udpVideo.parsePacket();
+  if (videoPacketSize) {
+    char videoCmd[32];
+    int len = udpVideo.read(videoCmd, sizeof(videoCmd) - 1);
+    if (len > 0) {
+      videoCmd[len] = '\0';
+      
+      if (strcmp(videoCmd, "START") == 0) {
+        videoClientIP = udpVideo.remoteIP();
+        videoClientPort = udpVideo.remotePort();
+        videoStreamActive = true;
+        #if DEBUG_ENABLED
+          Serial.printf("[VIDEO] Client connected: %s:%d\n", videoClientIP.toString().c_str(), videoClientPort);
+        #endif
+      }
+      else if (strcmp(videoCmd, "STOP") == 0) {
+        videoStreamActive = false;
+        #if DEBUG_ENABLED
+          Serial.println("[VIDEO] Stream stopped by client");
+        #endif
+      }
+    }
+  }
+  
+  // Send video frames via UDP
+  if (videoStreamActive && (millis() - lastFrameTime >= FRAME_INTERVAL_MS)) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb) {
+      // Send frame info header first (total size)
+      uint8_t header[8];
+      header[0] = 0xFF;  // Start marker
+      header[1] = 0xD8;  // JPEG marker
+      header[2] = (fb->len >> 24) & 0xFF;
+      header[3] = (fb->len >> 16) & 0xFF;
+      header[4] = (fb->len >> 8) & 0xFF;
+      header[5] = fb->len & 0xFF;
+      
+      uint16_t totalPackets = (fb->len + UDP_PACKET_SIZE - 1) / UDP_PACKET_SIZE;
+      header[6] = (totalPackets >> 8) & 0xFF;
+      header[7] = totalPackets & 0xFF;
+      
+      udpVideo.beginPacket(videoClientIP, videoClientPort);
+      udpVideo.write(header, 8);
+      udpVideo.endPacket();
+      
+      // Send frame data in chunks
+      uint16_t packetNum = 0;
+      for (size_t offset = 0; offset < fb->len; offset += UDP_PACKET_SIZE) {
+        size_t chunkSize = min((size_t)UDP_PACKET_SIZE, fb->len - offset);
+        
+        uint8_t packet[UDP_PACKET_SIZE + 2];
+        packet[0] = (packetNum >> 8) & 0xFF;  // Packet number
+        packet[1] = packetNum & 0xFF;
+        memcpy(packet + 2, fb->buf + offset, chunkSize);
+        
+        udpVideo.beginPacket(videoClientIP, videoClientPort);
+        udpVideo.write(packet, chunkSize + 2);
+        udpVideo.endPacket();
+        
+        packetNum++;
+        yield();  // Allow other tasks to run
+      }
+      
+      esp_camera_fb_return(fb);
+      lastFrameTime = millis();
+      
+      #if DEBUG_ENABLED
+        static unsigned long lastDebug = 0;
+        if (millis() - lastDebug > 5000) {
+          Serial.printf("[VIDEO] Sent frame: %d bytes, %d packets\n", fb->len, totalPackets);
+          lastDebug = millis();
+        }
+      #endif
+    }
+    yield();
+  }
+  
+  // Motor watchdog
+  if (motorsActive && (millis() - lastMotorCommand > MOTOR_WATCHDOG_TIMEOUT_MS)) {
+    #if DEBUG_ENABLED
+      Serial.println("[WATCHDOG] Motor stop!");
+    #endif
+    analogWrite(MOTOR_R_PIN_1, 0);
+    analogWrite(MOTOR_R_PIN_2, 0);
+    analogWrite(MOTOR_L_PIN_1, 0);
+    analogWrite(MOTOR_L_PIN_2, 0);
+    motorsActive = false;
+  }
+  
+  // Power saving
+  static unsigned long lastIdleCheck = 0;
+  if (millis() - lastIdleCheck > 5000) {
+    lastIdleCheck = millis();
+    
+    #if DEBUG_ENABLED
+      Serial.printf("[STATUS] Heap: %d, Clients: %d, Motors: %s\n", 
+                    ESP.getFreeHeap(), 
+                    ws.count(),
+                    motorsActive ? "Active" : "Stopped");
+    #endif
+  }
+  
+  // Short delay and yield to allow async tasks to run
+  delay(1);
+  yield();
+}
