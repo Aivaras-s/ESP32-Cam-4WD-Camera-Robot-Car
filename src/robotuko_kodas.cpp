@@ -536,6 +536,7 @@ void saveWiFiCredentials(const char* newSsid, const char* newPassword) {
 
 void startAccessPoint() {
   isAPMode = true;
+  WiFi.setHostname("esp32-cam-4wd");  // Set hostname before AP configuration
   WiFi.mode(WIFI_AP);
   WiFi.softAP(ap_ssid, ap_password);
   
@@ -584,11 +585,16 @@ void WiFiEvent(WiFiEvent_t event) {
       // Send gratuitous ARP immediately after getting IP
       sendGratuitousARP();
       
-      // Re-announce mDNS
+      // Re-announce mDNS (end first to ensure clean state)
+      MDNS.end();
       if (MDNS.begin("esp32-cam-4wd")) {
         MDNS.addService("http", "tcp", 80);
         #if DEBUG_ENABLED
           Serial.println("[mDNS] Service announced: esp32-cam-4wd.local");
+        #endif
+      } else {
+        #if DEBUG_ENABLED
+          Serial.println("[mDNS] Failed to initialize");
         #endif
       }
       
@@ -607,8 +613,8 @@ void WiFiEvent(WiFiEvent_t event) {
 }
 
 void startWiFiClient() {
+  WiFi.setHostname("esp32-cam-4wd");  // Set hostname BEFORE mode configuration
   WiFi.mode(WIFI_STA);
-  WiFi.setHostname("esp32-cam-4wd");
   
   // Configure for fast roaming
   WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
